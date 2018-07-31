@@ -17,26 +17,29 @@
 package uk.gov.hmrc.workitem
 
 import org.joda.time.{DateTime, Duration}
-import play.api.Play
 import play.api.libs.json._
-import reactivemongo.api.{DB, ReadPreference}
+import reactivemongo.api.collections.bson.BSONBatchCommands.CountCommand._
+import reactivemongo.api.commands.bson.BSONCountCommandImplicits._
+import reactivemongo.api.commands.bson.BSONFindAndModifyCommand
+import reactivemongo.api.commands.bson.BSONFindAndModifyCommand._
+import reactivemongo.api.commands.bson.BSONFindAndModifyImplicits._
+import reactivemongo.api.commands.{Command, ResolvedCollectionCommand}
 import reactivemongo.api.indexes.{Index, IndexType}
-import reactivemongo.bson.{BSONDocument, BSONObjectID}
-import reactivemongo.core.commands._
-import reactivemongo.play.json.BSONFormats
+import reactivemongo.api.{BSONSerializationPack, DB, FailoverStrategy, ReadPreference}
+import reactivemongo.bson.{BSONDocument, BSONDocumentWriter, BSONObjectID}
 import reactivemongo.play.json.ImplicitBSONHandlers._
 import uk.gov.hmrc.metrix.domain.MetricSource
 import uk.gov.hmrc.mongo.ReactiveRepository
 import uk.gov.hmrc.mongo.json.ReactiveMongoFormats
 
-
 import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration._
 
-abstract class WorkItemRepository[T, ID](collectionName: String,
-                                         mongo: () => DB,
-                                         itemFormat: Format[WorkItem[T]]
-                                        )(implicit idFormat: Format[ID], mfItem: Manifest[T], mfID: Manifest[ID])
+abstract class WorkItemRepository[T, ID](
+  collectionName: String,
+  mongo: () => DB,
+  itemFormat: Format[WorkItem[T]],
+  configValue: Option[Long]
+)(implicit idFormat: Format[ID], mfItem: Manifest[T], mfID: Manifest[ID])
   extends ReactiveRepository[WorkItem[T], ID](collectionName, mongo, itemFormat, idFormat)
   with Operations.Cancel[ID]
   with Operations.FindById[ID, T]
@@ -59,11 +62,11 @@ abstract class WorkItemRepository[T, ID](collectionName: String,
   private implicit val dateFormats = ReactiveMongoFormats.dateTimeFormats
 
   lazy val inProgressRetryAfter: Duration = {
-    implicit val app = Play.current
-    val configValue = Play.application.configuration.
-      getMilliseconds(inProgressRetryAfterProperty).
-      getOrElse(throw new IllegalStateException(s"$inProgressRetryAfterProperty config value not set"))
-    Duration.millis(configValue)
+    Duration.millis(
+      configValue.getOrElse(
+        throw new IllegalStateException(s"$inProgressRetryAfterProperty config value not set")
+      )
+    )
   }
 
   private def newWorkItem(receivedAt: DateTime, availableAt: DateTime, initialState: T => ProcessingStatus)(item: T) = WorkItem(
@@ -128,20 +131,29 @@ abstract class WorkItemRepository[T, ID](collectionName: String,
       document.map(_.map(Json.toJson(_).as[WorkItem[T]]))
     }
     val id = findNextItemId(failedBefore,availableBefore)
-    id.map(_.map(getWorkItem(_))).flatMap(_.getOrElse(Future.successful(None)))
+    id.map(_.map(getWorkItem)).flatMap(_.getOrElse(Future.successful(None)))
   }
+
+  val runner = Command.run(BSONSerializationPack, FailoverStrategy.default)
+
+  implicit val findAndModifyWriter: BSONDocumentWriter[ResolvedCollectionCommand[FindAndModify]] =
+    BSONSerializationPack.writer[ResolvedCollectionCommand[FindAndModify]] { BSONFindAndModifyCommand.serialize(_) }
+
+//  implicit val countReader: BSONDocumentWriter[ResolvedCollectionCommand[JSONCountCommand.Count]] =
+//    BSONSerializationPack.writer[ResolvedCollectionCommand[JSONCountCommand.Count]] { BSONFindAndModifyCommand.serialize(_) }
 
   private def findNextItemId(failedBefore: DateTime, availableBefore: DateTime)(implicit ec: ExecutionContext) : Future[Option[IdList]] = {
 
     def findNextItemIdByQuery(query: JsObject)(implicit ec: ExecutionContext): Future[Option[IdList]] = {
-      collection.db.command(
-        FindAndModify(
-          collection = collection.name,
-          query = query.as[BSONDocument],
-          fields = Some(Json.obj(workItemFields.id -> 1).as[BSONDocument]),
-          modify = Update(setStatusOperation(InProgress, None).as[BSONDocument], fetchNewObject = true)
-        )
-      ).map(_.map(Json.toJson(_).as[IdList]))
+
+      val command = FindAndModify(
+        query = query.as[BSONDocument],
+        modify = Update(setStatusOperation(InProgress, None).as[BSONDocument], fetchNewObject = true),
+        sort = None,
+        fields = Some(Json.obj(workItemFields.id -> 1).as[BSONDocument])
+      )
+
+      runner.apply(collection, command, ReadPreference.Primary).map(_.value.map(Json.toJson(_).as[IdList]))
     }
 
     def todoQuery(failedBefore: DateTime, availableBefore: DateTime): JsObject = {
@@ -183,27 +195,37 @@ abstract class WorkItemRepository[T, ID](collectionName: String,
 
   def cancel(id: ID)(implicit ec: ExecutionContext): Future[StatusUpdateResult] = {
     import uk.gov.hmrc.workitem.StatusUpdateResult._
-    collection.db.command(FindAndModify(
-      collection = collection.name,
+    val command = FindAndModify(
       query = Json.obj(
         workItemFields.id -> id,
         workItemFields.status -> Json.obj("$in" -> List(ToDo, Failed, PermanentlyFailed, Ignored, Duplicate, Deferred)) // TODO we should be able to express the valid to/from states in traits of ProcessingStatus
       ).as[BSONDocument],
       modify = Update(setStatusOperation(Cancelled, None).as[BSONDocument], fetchNewObject = false)
-    )).flatMap {
-      case Some(item) => Future.successful(Updated(
-        previousStatus = Json.toJson(item).\(workItemFields.status).as[ProcessingStatus],
-        newStatus = Cancelled
-      ))
-      case None => findById(id).map {
-        case Some(item) => NotUpdated(item.status)
-        case None => NotFound
+    )
+
+    runner(collection, command).flatMap { res =>
+      res.value match {
+        case Some(item) => Future.successful(Updated(
+          previousStatus = Json.toJson(item).\(workItemFields.status).as[ProcessingStatus],
+          newStatus = Cancelled
+        ))
+        case None => findById(id).map {
+          case Some(item) => NotUpdated(item.status)
+          case None => NotFound
+        }
       }
     }
   }
 
-  def count(state: ProcessingStatus)(implicit ec: ExecutionContext): Future[Int] = collection.db.command(
-    Count(collection.name, Some(BSONDocument(workItemFields.status -> state.name))), ReadPreference.secondaryPreferred)
+  def count(state: ProcessingStatus)(implicit ec: ExecutionContext): Future[Int] = {
+    runner(
+      collection,
+      Count(
+        BSONDocument(workItemFields.status -> state.name)
+      ),
+      ReadPreference.secondaryPreferred
+    ).map(_.count)
+  }
 
   private def setStatusOperation(newStatus: ProcessingStatus, availableAt: Option[DateTime]): JsObject = {
     val fields = Json.obj(
